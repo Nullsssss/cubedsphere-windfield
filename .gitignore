@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.grib2
+*.grb2
+.DS_Store
+docs/preview_full.png
