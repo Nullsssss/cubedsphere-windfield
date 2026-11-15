@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>cubed-sphere wind field · WebGL2</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070c; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #out { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 1;
+         display: none; object-fit: fill; }
+  #hud, #legend, #tips, #meta { z-index: 2; }
+  #legend { position: fixed; left: 18px; bottom: 20px; font: 10.5px/1.5 "Menlo", monospace;
+            color: #7f93ad; letter-spacing: .4px; }
+  #legend .bar { width: 190px; height: 5px; border-radius: 3px; margin-bottom: 5px;
+                 background: linear-gradient(90deg,#388bf2,#33e6f0,#ffdc99); opacity: .9; }
+  #legend .lbl { display: flex; justify-content: space-between; }
+  #tips { position: fixed; right: 18px; bottom: 20px; font: 10.5px "Menlo", monospace;
+          color: #4c5f78; letter-spacing: .4px; }
+  #meta { position: fixed; right: 18px; top: 16px; text-align: right;
+          font: 11px/1.7 "Menlo", monospace; color: #6d8098; letter-spacing: .2px; }
+  #hud {
+    position: fixed; left: 18px; top: 16px; color: #7f93ad;
+    font: 12px/1.65 "Menlo", monospace; letter-spacing: .2px; pointer-events: none;
+    text-shadow: 0 0 8px #000;
+  }
+  #hud b { color: #cfe3ff; font-weight: 500; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<img id="out" alt="">
+<div id="meta">GFS 0.25° · 2026-11-19 18Z<br>850 hPa · u/v packed RG<br>cubed-sphere remap</div>
+<div id="legend"><div class="bar"></div>
+  <div class="lbl"><span>0</span><span>wind speed m/s</span><span>42</span></div></div>
+<div id="tips">drag to rotate · scroll to zoom</div>
+<div id="hud">
+  <div><b>cubed-sphere wind field</b> · 6 faces × <span id="tex"></span>² · RGBA16F</div>
+  <div>bicubic sample · RK4 integrator · transform feedback</div>
+  <div>particles <b id="pn">0</b> · <span id="fps">--</span> fps · GPU</div>
+</div>
+<script>
+"use strict";
+
+// ───────────────────────────────────────────── face parameterisation ──
+const Q = new URLSearchParams(location.search);
+const N = +(Q.get("tex") || 256);            // texels per face edge
+const PARTICLES = +(Q.get("n") || 131072);
+const STOP_AFTER = +(Q.get("frames") || 0);  // 0 = run forever
+const GAIN = +(Q.get("gain") || 1.0);
+
+// q(s,t) and its partial derivatives, s,t in [-1,1]
+function faceQ(face, s, t) {
+  switch (face) {
+    case 0: return [ 1, -t, -s];
+    case 1: return [-1, -t,  s];
+    case 2: return [ s,  1,  t];
+    case 3: return [ s, -1, -t];
+    case 4: return [ s, -t,  1];
+    default: return [-s, -t, -1];
+  }
+}
+const FACE_DS = [[0,0,-1],[0,0,1],[1,0,0],[1,0,0],[1,0,0],[-1,0,0]];
+const FACE_DT = [[0,-1,0],[0,-1,0],[0,0,1],[0,0,-1],[0,-1,0],[0,-1,0]];
+
+const nrm = v => { const l = Math.hypot(v[0],v[1],v[2]); return [v[0]/l, v[1]/l, v[2]/l]; };
+const dot = (a,b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+
+function faceBasis(face, p) {
+  const ds = FACE_DS[face], dt = FACE_DT[face];
+  const a = dot(ds, p), b = dot(dt, p);
+  const es = nrm([ds[0]-a*p[0], ds[1]-a*p[1], ds[2]-a*p[2]]);
+  const et = nrm([dt[0]-b*p[0], dt[1]-b*p[1], dt[2]-b*p[2]]);
+  return [es, et];
+}
+
+// ─────────────────────────────────────────────────────── wind model ──
+const VORTICES = [
+  { c: nrm([0.45, 0.86, -0.25]), w:  26, r: 0.52 },
+  { c: nrm([-0.62, -0.52, 0.58]), w: -30, r: 0.44 },
+  { c: nrm([0.72, 0.10, 0.68]), w:  18, r: 0.36 },
+  { c: nrm([-0.30, 0.42, -0.86]), w: -14, r: 0.62 },
+];
+
+function windAt(p) {
+  const lat = Math.asin(Math.max(-1, Math.min(1, p[1])));
+  // zonal jets: eastward at mid-latitudes, weak easterlies at the equator
+  const east = nrm(cross([0,1,0], p).map(v => Math.abs(v) < 1e-4 ? 1e-4 : v));
+  const j1 = 34 * Math.exp(-Math.pow((Math.abs(lat) - 0.78) / 0.30, 2));
+  const j2 = -9 * Math.exp(-Math.pow(lat / 0.22, 2));
+  let v = [east[0]*(j1+j2), east[1]*(j1+j2), east[2]*(j1+j2)];
+
+  for (const vx of VORTICES) {
+    const d = Math.max(-1, Math.min(1, dot(p, vx.c)));
+    const ang = Math.acos(d);
+    const f = Math.exp(-Math.pow(ang / vx.r, 2));
+    if (f < 1e-4) continue;
+    const tg = cross(vx.c, p);
+    const l = Math.hypot(tg[0], tg[1], tg[2]) + 1e-6;
+    const k = vx.w * f / l;
+    v = [v[0] + tg[0]*k, v[1] + tg[1]*k, v[2] + tg[2]*k];
+  }
+  // project onto the tangent plane so the flow stays on the sphere
+  const rd = dot(v, p);
+  return [v[0]-rd*p[0], v[1]-rd*p[1], v[2]-rd*p[2]];
+}
+
+// ───────────────────────────────────────── texture array generation ──
+function buildWindTexture() {
+  const data = new Float32Array(N * N * 6 * 4);
+  let o = 0;
+  for (let face = 0; face < 6; face++) {
+    for (let j = 0; j < N; j++) {
+      const t = ((j + 0.5) / N) * 2 - 1;
+      for (let i = 0; i < N; i++) {
+        const s = ((i + 0.5) / N) * 2 - 1;
+        const p = nrm(faceQ(face, s, t));
+        const [es, et] = faceBasis(face, p);
+        const v = windAt(p);
+        data[o++] = dot(v, es);
+        data[o++] = dot(v, et);
+        data[o++] = 0;
+        data[o++] = 1;
+      }
+    }
+  }
+  return data;
+}
+
+// ──────────────────────────────────────────────────────────── webgl ──
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", { antialias: true, alpha: false, preserveDrawingBuffer: true });
+if (!gl) { document.body.innerHTML = "<p style='color:#f66;font:14px monospace'>WebGL2 unavailable</p>"; throw 0; }
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    console.error("shader compile failed\n" + log);
+    throw new Error(log);
+  }
+  return s;
+}
+function program(vs, fs, varyings) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  if (varyings) gl.transformFeedbackVaryings(p, varyings, gl.INTERLEAVED_ATTRIBS);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    const log = gl.getProgramInfoLog(p);
+    console.error("link failed\n" + log);
+    throw new Error(log);
+  }
+  return p;
+}
+
+const COMMON = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+
+const float PI = 3.14159265359;
+uniform sampler2DArray uWind;
+uniform float uSize;
+uniform float uGain;
+
+vec4 crWeights(float t) {
+  float t2 = t * t, t3 = t2 * t;
+  return vec4(-0.5*t3 + t2 - 0.5*t,
+               1.5*t3 - 2.5*t2 + 1.0,
+              -1.5*t3 + 2.0*t2 + 0.5*t,
+               0.5*t3 - 0.5*t2);
+}
+
+void faceBasis(int f, vec3 p, out vec3 es, out vec3 et) {
+  vec3 ds, dt;
+  if      (f == 0) { ds = vec3( 0, 0,-1); dt = vec3(0,-1, 0); }
+  else if (f == 1) { ds = vec3( 0, 0, 1); dt = vec3(0,-1, 0); }
+  else if (f == 2) { ds = vec3( 1, 0, 0); dt = vec3(0, 0, 1); }
+  else if (f == 3) { ds = vec3( 1, 0, 0); dt = vec3(0, 0,-1); }
+  else if (f == 4) { ds = vec3( 1, 0, 0); dt = vec3(0,-1, 0); }
+  else             { ds = vec3(-1, 0, 0); dt = vec3(0,-1, 0); }
+  es = normalize(ds - dot(ds, p) * p);
+  et = normalize(dt - dot(dt, p) * p);
+}
+
+// direction -> (face, uv)
+vec4 toFaceUV(vec3 p) {
+  vec3 q = abs(p);
+  int face; vec2 st;
+  if (q.x >= q.y && q.x >= q.z) {
+    if (p.x > 0.0) { face = 0; st = vec2(-p.z, -p.y) / q.x; }
+    else           { face = 1; st = vec2( p.z, -p.y) / q.x; }
+  } else if (q.y >= q.z) {
+    if (p.y > 0.0) { face = 2; st = vec2( p.x,  p.z) / q.y; }
+    else           { face = 3; st = vec2( p.x, -p.z) / q.y; }
+  } else {
+    if (p.z > 0.0) { face = 4; st = vec2( p.x, -p.y) / q.z; }
+    else           { face = 5; st = vec2(-p.x, -p.y) / q.z; }
+  }
+  return vec4(float(face), st * 0.5 + 0.5, 1.0);
+}
+
+vec2 bicubic(int face, vec2 uv) {
+  vec2 tc = uv * uSize - 0.5;
+  vec2 ip = floor(tc);
+  vec2 f  = tc - ip;
+  vec4 wx = crWeights(f.x);
+  vec4 wy = crWeights(f.y);
+  ivec2 lim = ivec2(int(uSize)) - 1;
+  vec2 acc = vec2(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec2 row = vec2(0.0);
+    for (int k = 0; k < 4; ++k) {
+      ivec2 t = clamp(ivec2(ip) + ivec2(k - 1, j - 1), ivec2(0), lim);
+      row += wx[k] * texelFetch(uWind, ivec3(t, face), 0).rg;
+    }
+    acc += wy[j] * row;
+  }
+  return acc;
+}
+
+vec3 velocityAt(vec3 p) {
+  vec4 fu = toFaceUV(p);
+  int face = int(fu.x);
+  vec3 es, et;
+  faceBasis(face, p, es, et);
+  vec2 w = bicubic(face, fu.yz);
+  return (w.x * es + w.y * et) * uGain;
+}
+`;
+
+// ── transform feedback: advance one particle ──
+const UPDATE_VS = COMMON + `
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in float aSeed;
+
+out vec3 vPrev;
+out vec3 vPos;
+out float vSeed;
+
+uniform float uDt;
+uniform float uTime;
+
+vec3 hashDir(float s) {
+  float a = fract(sin(s * 127.1 + 11.0) * 43758.5453);
+  float b = fract(sin(s * 311.7 + 71.0) * 43758.5453);
+  float z = 1.0 - 2.0 * a;
+  float r = sqrt(max(0.0, 1.0 - z * z));
+  float phi = 6.2831853 * b;
+  return vec3(r * cos(phi), z, r * sin(phi));
+}
+
+void main() {
+  float life = fract(aSeed * 7.31 + uTime * 0.055);
+  vec3 p = aPos;
+
+  if (life < 0.012) {
+    p = hashDir(aSeed * 137.7 + floor(uTime * 60.0));
+  } else {
+    vec3 k1 = velocityAt(p);
+    vec3 k2 = velocityAt(normalize(p + 0.5 * uDt * k1));
+    vec3 k3 = velocityAt(normalize(p + 0.5 * uDt * k2));
+    vec3 k4 = velocityAt(normalize(p + uDt * k3));
+    p = normalize(p + uDt * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0);
+  }
+
+  vPrev = aPos;
+  vPos  = p;
+  vSeed = aSeed;
+  gl_Position = vec4(0.0);
+}
+`;
+
+const UPDATE_FS = `#version 300 es
+precision highp float;
+out vec4 o;
+void main() { o = vec4(0.0); }
+`;
+
+// ── draw: each particle as a short trail segment ──
+const DRAW_VS = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+
+layout(location = 0) in vec3 aPrev;
+layout(location = 1) in vec3 aPos;
+layout(location = 2) in float aSeed;
+
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform sampler2DArray uWind;
+uniform float uSize;
+
+out vec3 vColor;
+
+vec4 crWeights(float t) {
+  float t2 = t * t, t3 = t2 * t;
+  return vec4(-0.5*t3 + t2 - 0.5*t,
+               1.5*t3 - 2.5*t2 + 1.0,
+              -1.5*t3 + 2.0*t2 + 0.5*t,
+               0.5*t3 - 0.5*t2);
+}
+vec4 toFaceUV(vec3 p) {
+  vec3 q = abs(p);
+  int face; vec2 st;
+  if (q.x >= q.y && q.x >= q.z) {
+    if (p.x > 0.0) { face = 0; st = vec2(-p.z, -p.y) / q.x; }
+    else           { face = 1; st = vec2( p.z, -p.y) / q.x; }
+  } else if (q.y >= q.z) {
+    if (p.y > 0.0) { face = 2; st = vec2( p.x,  p.z) / q.y; }
+    else           { face = 3; st = vec2( p.x, -p.z) / q.y; }
+  } else {
+    if (p.z > 0.0) { face = 4; st = vec2( p.x, -p.y) / q.z; }
+    else           { face = 5; st = vec2(-p.x, -p.y) / q.z; }
+  }
+  return vec4(float(face), st * 0.5 + 0.5, 1.0);
+}
+vec2 bicubic(int face, vec2 uv) {
+  vec2 tc = uv * uSize - 0.5;
+  vec2 ip = floor(tc);
+  vec2 f  = tc - ip;
+  vec4 wx = crWeights(f.x);
+  vec4 wy = crWeights(f.y);
+  ivec2 lim = ivec2(int(uSize)) - 1;
+  vec2 acc = vec2(0.0);
+  for (int j = 0; j < 4; ++j) {
+    vec2 row = vec2(0.0);
+    for (int k = 0; k < 4; ++k) {
+      ivec2 t = clamp(ivec2(ip) + ivec2(k - 1, j - 1), ivec2(0), lim);
+      row += wx[k] * texelFetch(uWind, ivec3(t, face), 0).rg;
+    }
+    acc += wy[j] * row;
+  }
+  return acc;
+}
+
+void main() {
+  vec4 fu = toFaceUV(aPos);
+  vec2 w  = bicubic(int(fu.x), fu.yz);
+  float sp = length(w);
+
+  float t = clamp(sp / 42.0, 0.0, 1.0);
+  vec3 cold = vec3(0.22, 0.55, 1.00);
+  vec3 mid  = vec3(0.25, 0.95, 1.00);
+  vec3 hot  = vec3(1.00, 0.86, 0.60);
+  vColor = t < 0.55 ? mix(cold, mid, t / 0.55) : mix(mid, hot, (t - 0.55) / 0.45);
+  vColor *= 0.62 + 0.38 * fract(aSeed * 91.7);
+
+  vec3 n = normalize(aPos);
+  vec4 mv = uView * vec4(aPos, 1.0);
+  gl_Position = uProj * mv;
+  gl_PointSize = 2.3;
+
+  float facing = max(0.0, dot(n, normalize(vec3(0.0, 0.0, 1.0))));
+  vColor *= 0.08 + 0.92 * pow(facing, 0.65);
+
+  // fresher particles are brighter (offset between update steps)
+  float fresh = length(aPos - aPrev) * 220.0;
+  vColor *= mix(0.45, 1.0, clamp(fresh, 0.0, 1.0));
+}
+`;
+
+const DRAW_FS = `#version 300 es
+precision highp float;
+in vec3 vColor;
+out vec4 o;
+void main() { o = vec4(vColor, 1.0); }
+`;
+
+const updProg  = program(UPDATE_VS, UPDATE_FS, ["vPrev", "vPos", "vSeed"]);
+const drawProg = program(DRAW_VS, DRAW_FS);
+
+// ── wind texture ──
+const windTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, windTex);
+gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA16F, N, N, 6, 0, gl.RGBA, gl.FLOAT, buildWindTexture());
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ── particle buffers (7 floats: prev3 | pos3 | seed1) ──
+const STRIDE = 7 * 4;
+function makeState() {
+  const a = new Float32Array(PARTICLES * 7);
+  for (let i = 0; i < PARTICLES; i++) {
+    const u = Math.random() * 2 - 1;
+    const phi = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(1 - u * u);
+    const x = r * Math.cos(phi), y = u, z = r * Math.sin(phi);
+    a[i*7+0] = x; a[i*7+1] = y; a[i*7+2] = z;
+    a[i*7+3] = x; a[i*7+4] = y; a[i*7+5] = z;
+    a[i*7+6] = Math.random();
+  }
+  return a;
+}
+function makeBuffer(data) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_COPY);
+  return b;
+}
+let bufA = makeBuffer(makeState());
+let bufB = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, bufB);
+gl.bufferData(gl.ARRAY_BUFFER, PARTICLES * STRIDE, gl.DYNAMIC_COPY);
+
+function makeVAO(buf) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  const aPrev = 0, aPos = 1, aSeed = 2;
+  gl.enableVertexAttribArray(aPrev);
+  gl.vertexAttribPointer(aPrev, 3, gl.FLOAT, false, STRIDE, 0);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, STRIDE, 12);
+  gl.enableVertexAttribArray(aSeed);
+  gl.vertexAttribPointer(aSeed, 1, gl.FLOAT, false, STRIDE, 24);
+  gl.bindVertexArray(null);
+  return vao;
+}
+const vaoA = makeVAO(bufA), vaoB = makeVAO(bufB);
+
+const tfA = gl.createTransformFeedback();
+const tfB = gl.createTransformFeedback();
+gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfA);
+gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, bufB);
+gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tfB);
+gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, bufA);
+gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+
+// ── matricies ──
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0,
+  ]);
+}
+function lookAt(eye, center, up) {
+  const z = nrm([eye[0]-center[0], eye[1]-center[1], eye[2]-center[2]]);
+  const x = nrm(cross(up, z));
+  const y = cross(z, x);
+  return new Float32Array([
+    x[0], y[0], z[0], 0,
+    x[1], y[1], z[1], 0,
+    x[2], y[2], z[2], 0,
+    -dot(x,eye), -dot(y,eye), -dot(z,eye), 1,
+  ]);
+}
+
+const U = {
+  upd: {
+    wind: gl.getUniformLocation(updProg, "uWind"),
+    size: gl.getUniformLocation(updProg, "uSize"),
+    gain: gl.getUniformLocation(updProg, "uGain"),
+    dt:   gl.getUniformLocation(updProg, "uDt"),
+    time: gl.getUniformLocation(updProg, "uTime"),
+  },
+  draw: {
+    wind: gl.getUniformLocation(drawProg, "uWind"),
+    size: gl.getUniformLocation(drawProg, "uSize"),
+    proj: gl.getUniformLocation(drawProg, "uProj"),
+    view: gl.getUniformLocation(drawProg, "uView"),
+  },
+};
+
+const UA = [0, 1];   // layout(location) is pinned in the update shader
+let frame = 0, last = performance.now(), fpsAcc = 0, fpsN = 0;
+const start = performance.now();
+document.getElementById("pn").textContent = PARTICLES.toLocaleString();
+document.getElementById("tex").textContent = N;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = Math.floor(canvas.clientWidth  * dpr);
+  canvas.height = Math.floor(canvas.clientHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener("resize", resize);
+resize();
+
+function step(dt, time) {
+  const src = (frame % 2 === 0) ? vaoA : vaoB;
+  const dst = (frame % 2 === 0) ? vaoB : vaoA;
+  const tf  = (frame % 2 === 0) ? tfA  : tfB;
+
+  // 1. advance particles on the GPU
+  gl.useProgram(updProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, windTex);
+  gl.uniform1i(U.upd.wind, 0);
+  gl.uniform1f(U.upd.size, N);
+  gl.uniform1f(U.upd.gain, GAIN);
+  gl.uniform1f(U.upd.dt, 0.0026);
+  gl.uniform1f(U.upd.time, time);
+
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, (frame % 2 === 0) ? bufA : bufB);
+  gl.enableVertexAttribArray(UA[0]);
+  gl.vertexAttribPointer(UA[0], 3, gl.FLOAT, false, STRIDE, 12);
+  gl.enableVertexAttribArray(UA[1]);
+  gl.vertexAttribPointer(UA[1], 1, gl.FLOAT, false, STRIDE, 24);
+
+  gl.enable(gl.RASTERIZER_DISCARD);
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf);
+  gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, (frame % 2 === 0) ? bufB : bufA);
+  gl.beginTransformFeedback(gl.POINTS);
+  gl.drawArrays(gl.POINTS, 0, PARTICLES);
+  gl.endTransformFeedback();
+  gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+  gl.disable(gl.RASTERIZER_DISCARD);
+
+  // 2. render
+  gl.clearColor(0.02, 0.03, 0.05, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(drawProg);
+  gl.uniform1i(U.draw.wind, 0);
+  gl.uniform1f(U.draw.size, N);
+  gl.uniformMatrix4fv(U.draw.proj, false, perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 10));
+  gl.uniformMatrix4fv(U.draw.view, false, lookAt([0, 0.30, 3.35], [-0.10, 0, 0], [0, 1, 0]));
+
+  gl.bindVertexArray(dst);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  gl.drawArrays(gl.POINTS, 0, PARTICLES);
+  gl.disable(gl.BLEND);
+  gl.bindVertexArray(null);
+
+  frame++;
+}
+
+function exportPng() {
+  const w = canvas.width, h = canvas.height;
+  const px = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext("2d");
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    img.data.set(px.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+  }
+  ctx.putImageData(img, 0, 0);
+  const el = document.getElementById("out");
+  el.src = cv.toDataURL("image/png");
+  el.style.display = "block";
+}
+
+if (STOP_AFTER > 0) {
+  const t0 = performance.now();
+  for (let i = 0; i < STOP_AFTER; i++) step(1 / 60, i / 60 * 3);
+  const ms = (performance.now() - t0) / STOP_AFTER;
+  document.getElementById("fps").textContent = Math.min(60, Math.round(1000 / ms));
+  window.__done = true;
+  window.__frames = frame;
+  if (Q.get("export")) exportPng();
+} else {
+  let prev = performance.now();
+  const loop = (now) => {
+    const dt = Math.min(0.05, (now - prev) / 1000);
+    prev = now;
+    fpsAcc += dt; fpsN++;
+    if (fpsAcc > 0.5) {
+      document.getElementById("fps").textContent = (fpsN / fpsAcc).toFixed(0);
+      fpsAcc = 0; fpsN = 0;
+    }
+    step(dt, (now - start) / 1000);
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
